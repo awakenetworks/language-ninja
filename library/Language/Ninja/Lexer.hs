@@ -37,8 +37,6 @@
 {-# OPTIONS_GHC #-}
 {-# OPTIONS_HADDOCK #-}
 
-{-# LANGUAGE DeriveAnyClass             #-}
-{-# LANGUAGE DeriveDataTypeable         #-}
 {-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE OverloadedStrings          #-}
@@ -62,14 +60,11 @@ module Language.Ninja.Lexer
   , LFile (..)
   , LBinding (..)
   , LBuild (..)
-  , LexError(..)
   , lexerFile, lexer
   ) where
 
-import           Control.Exception            (Exception)
 import qualified Control.Exception
 import           Control.Monad.Error.Class    (MonadError(..))
-import           Data.Typeable                (Typeable)
 
 import qualified Data.ByteString.Char8        as BSC8
 import qualified Data.ByteString.Internal     as BS.Internal
@@ -96,6 +91,7 @@ import           GHC.Generics                 (Generic)
 
 import           Language.Ninja.AST           (Str)
 import qualified Language.Ninja.AST           as AST
+import           Language.Ninja.Errors.Parse  (ParseError(..))
 
 import qualified Language.Ninja.Misc.Located  as Loc
 
@@ -195,19 +191,6 @@ instance NFData LBuild
 
 --------------------------------------------------------------------------------
 
--- | Lexer failures
-data LexError
-  = MissingColon
-  -- ^ A colon character was expected but not found
-  | UnexpectedSeparator Char
-  -- ^ A separator charactor was expected but the given character was found
-  -- instead
-  deriving (Eq, Hashable, NFData, Show, Generic, Typeable)
-
-instance Exception LexError
-
---------------------------------------------------------------------------------
-
 -- | Lex the given file.
 lexerFile :: FilePath -> IO [Lexeme]
 lexerFile file = do
@@ -217,12 +200,12 @@ lexerFile file = do
     Right lexemes   -> return lexemes
 
 -- | Lex the given 'BSC8.ByteString'.
-lexer :: MonadError LexError m => Str -> m [Lexeme]
+lexer :: MonadError ParseError m => Str -> m [Lexeme]
 lexer x = lexerLoop (MkStr0 (BSC8.append x "\n\n\0"))
 
 --------------------------------------------------------------------------------
 
-lexerLoop :: MonadError LexError m => Str0 -> m [Lexeme]
+lexerLoop :: MonadError ParseError m => Str0 -> m [Lexeme]
 lexerLoop c_x
   = case c of
       '\r'                                  -> lexerLoop x0
@@ -247,7 +230,7 @@ lexerLoop c_x
                               then Just $ MkStr0 $ BSC8.drop (BSC8.length b) x
                               else Nothing
 
-lexBind :: MonadError LexError m => Str0 -> m [Lexeme]
+lexBind :: MonadError ParseError m => Str0 -> m [Lexeme]
 lexBind c_x | (c, x) <- Str0.list0 c_x
   = case c of
       '\r' -> lexerLoop x
@@ -256,7 +239,7 @@ lexBind c_x | (c, x) <- Str0.list0 c_x
       '\0' -> return []
       _    -> lexxBind LexBind c_x
 
-lexBuild :: MonadError LexError m => Str0 -> m [Lexeme]
+lexBuild :: MonadError ParseError m => Str0 -> m [Lexeme]
 lexBuild x0 = do
   (outputs, x1) <- lexxExprs True x0
   let (rule, x2) = Str0.span0 isVarDot $ dropSpace x1
@@ -264,14 +247,14 @@ lexBuild x0 = do
   x4 <- lexerLoop x3
   return (LexBuild (MkLBuild outputs rule deps) : x4)
 
-lexDefault :: MonadError LexError m => Str0 -> m [Lexeme]
+lexDefault :: MonadError ParseError m => Str0 -> m [Lexeme]
 lexDefault str0 = do
   (files, str1) <- lexxExprs False str0
   str2 <- lexerLoop str1
   return (LexDefault files : str2)
 
 lexRule, lexPool, lexInclude, lexSubninja, lexDefine
-  :: MonadError LexError m => Str0 -> m [Lexeme]
+  :: MonadError ParseError m => Str0 -> m [Lexeme]
 lexRule     = lexxName LexRule
 lexPool     = lexxName LexPool
 lexInclude  = lexxFile LexInclude
@@ -279,7 +262,7 @@ lexSubninja = lexxFile LexSubninja
 lexDefine   = lexxBind LexDefine
 
 lexxBind
-  :: MonadError LexError m => (LBinding -> Lexeme) -> Str0 -> m [Lexeme]
+  :: MonadError ParseError m => (LBinding -> Lexeme) -> Str0 -> m [Lexeme]
 lexxBind ctor x0 = do
   let (var,  x1) = Str0.span0 isVarDot x0
       (eq,   x2) = Str0.list0 $ dropSpace x1
@@ -291,19 +274,19 @@ lexxBind ctor x0 = do
          , show (Str0.take0 100 x0)
          ] |> mconcat |> error
 
-lexxFile :: MonadError LexError m => (LFile -> Lexeme) -> Str0 -> m [Lexeme]
+lexxFile :: MonadError ParseError m => (LFile -> Lexeme) -> Str0 -> m [Lexeme]
 lexxFile ctor str0 = do
   let (expr, str1) = lexxExpr False False $ dropSpace str0
   str2 <- lexerLoop str1
   return (ctor (MkLFile expr) : str2)
 
-lexxName :: MonadError LexError m => (LName -> Lexeme) -> Str0 -> m [Lexeme]
+lexxName :: MonadError ParseError m => (LName -> Lexeme) -> Str0 -> m [Lexeme]
 lexxName ctor x = do
   let (name, rest) = splitLineCont x
   lexemes <- lexerLoop rest
   return (ctor (MkLName name) : lexemes)
 
-lexxExprs :: MonadError LexError m => Bool -> Str0 -> m ([AST.Expr], Str0)
+lexxExprs :: MonadError ParseError m => Bool -> Str0 -> m ([AST.Expr], Str0)
 lexxExprs sColon x0
   = let c  = Str0.head0 c_x
         x1 = Str0.tail0 c_x
@@ -312,11 +295,11 @@ lexxExprs sColon x0
            (exprs, x2) <- lexxExprs sColon $ dropSpace x1
            return (a:exprs, x2)
          ':'  | sColon -> return ([a], x1)
-         _    | sColon -> throwError MissingColon
+         _    | sColon -> throwError LexExpectedColon
          '\r'          -> return (a $: dropN x1)
          '\n'          -> return (a $: x1)
          '\0'          -> return (a $: c_x)
-         _             -> throwError (UnexpectedSeparator c)
+         _             -> throwError (LexUnexpectedSeparator c)
   where
     (a, c_x) = lexxExpr sColon True x0
     ($:) :: AST.Expr -> Str0 -> ([AST.Expr], Str0)
